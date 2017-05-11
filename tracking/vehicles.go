@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"math"
 
 	log "github.com/Sirupsen/logrus"
 	"github.com/gorilla/mux"
@@ -287,12 +288,137 @@ func (App *App) UpdateMessageHandler(w http.ResponseWriter, r *http.Request) {
 	WriteJSON(w, messages)
 }
 
+func (App *App) LastUpdatesForVehicle(vehicle *Vehicle, count int) (updates []VehicleUpdate) {
+	err := App.Updates.Find(bson.M{"vehicleID": vehicle.VehicleID}).Sort("-created").Limit(count).All(&updates)
+	if err != nil {
+		log.Error(err)
+	}
+	return
+}
+
+func (App *App) GuessRouteForVehicle(vehicle *Vehicle) (route Route) {
+	samples := 50
+	var routes []Route
+	err := App.Routes.Find(bson.M{}).All(&routes)
+	if err != nil {
+		log.Error(err)
+	}
+
+	routeDistances := make(map[string]float64)
+	for _, route := range routes {
+		routeDistances[route.ID] = 0
+		// routeDistances[route.ID] = math.Inf(0)
+	}
+
+	updates := App.LastUpdatesForVehicle(vehicle, samples)
+
+	for _, update := range updates {
+		updateLatitude, err := strconv.ParseFloat(update.Lat, 64)
+		if err != nil {
+			log.Error(err)
+		}
+		updateLongitude, err := strconv.ParseFloat(update.Lng, 64)
+		if err != nil {
+			log.Error(err)
+		}
+
+		for _, route := range routes {
+			nearestDistance := math.Inf(0)
+			for _, coord := range route.Coords {
+				distance := math.Sqrt(math.Pow(updateLatitude - coord.Lat, 2) +
+					math.Pow(updateLongitude - coord.Lng, 2))
+				if distance < nearestDistance {
+					nearestDistance = distance
+				}
+			}
+			routeDistances[route.ID] += nearestDistance
+		}
+	}
+
+	minDistance := math.Inf(0)
+	var minRouteID string
+	for id := range routeDistances {
+		distance := routeDistances[id] / float64(samples)
+		if distance < minDistance {
+			minDistance = distance
+			minRouteID = id
+		}
+	}
+
+	err = App.Routes.Find(bson.M{"id": minRouteID}).One(&route)
+	if err != nil {
+		log.Error(err)
+	}
+
+	return
+}
+
+func (App *App) NextStopForVehicle(vehicle *Vehicle) (nextStop string) {
+	route := App.GuessRouteForVehicle(vehicle)
+	log.Info(vehicle.VehicleName, ": ", route.Name)
+
+	var stops []Stop
+
+	err := App.Stops.Find(bson.M{"routeId": route.ID}).All(&stops)
+	if err != nil {
+		log.Error(err)
+	}
+
+	// nearest stop
+	updates := App.LastUpdatesForVehicle(vehicle, 25)
+	for _, update := range updates {
+		updateLatitude, err := strconv.ParseFloat(update.Lat, 64)
+		if err != nil {
+			log.Error(err)
+		}
+		updateLongitude, err := strconv.ParseFloat(update.Lng, 64)
+		if err != nil {
+			log.Error(err)
+		}
+		nearestStopDistance := math.Inf(0)
+		var nearestStop Stop
+		for _, stop := range stops {
+			distance := math.Sqrt(math.Pow(updateLatitude - stop.Lat, 2) +
+				math.Pow(updateLongitude - stop.Lng, 2))
+			if distance < nearestStopDistance {
+				nearestStopDistance = distance
+				nearestStop = stop
+			}
+		}
+		log.Info(nearestStop.Name)
+	}
+
+	log.Print(stops)
+
+	update := App.LastUpdatesForVehicle(vehicle, 1)[0]
+	return update.Lat
+}
+
+func (App *App) AllVehicles() (vehicles []Vehicle) {
+	err := App.Vehicles.Find(bson.M{}).All(&vehicles)
+	if err != nil {
+		log.Error(err)
+	}
+	return
+}
+
+func (App *App) NextStops() {
+	for {
+		for _, vehicle := range App.AllVehicles() {
+			if vehicle.VehicleName == "Bus 96" {
+				App.NextStopForVehicle(&vehicle)
+			}
+		}
+		time.Sleep(time.Second * 10)
+	}
+}
+
 // CardinalDirection figures out the cardinal direction of a vehicle's heading
 func CardinalDirection(h *string) string {
 	heading, err := strconv.ParseFloat(*h, 64)
 	if err != nil {
 		fmt.Println("ERROR", err.Error())
-		return "North"
+		return "North" // hmmmm
 	}
 	switch {
 	case (heading >= 22.5 && heading < 67.5):
